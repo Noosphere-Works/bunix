@@ -28,13 +28,43 @@
           }:
           import ./lib/node-modules.nix { inherit pkgs lock name; };
 
+        flake.lib.workspace =
+          {
+            pkgs,
+            root,
+            lock ? root + "/bun.lock",
+            exclude ? [ ],
+            name ? "node-modules",
+          }:
+          import ./lib/workspace.nix {
+            inherit
+              pkgs
+              root
+              lock
+              exclude
+              name
+              ;
+          };
+
         perSystem =
           { pkgs, ... }:
           let
-            inherit (config.flake.lib) nodeModules;
+            inherit (config.flake.lib) nodeModules workspace;
             fixture = nodeModules {
               inherit pkgs;
               lock = ./fixture/bun.lock;
+            };
+            # The fixture again, through `workspace`. It plants `.env.local`
+            # at the root and in member one, which `src` drops, and
+            # `.env.production` in member one, which `src` keeps.
+            fixtureWorkspace = workspace {
+              inherit pkgs;
+              root = ./fixture;
+            };
+            excluding = workspace {
+              inherit pkgs;
+              root = ./fixture;
+              exclude = [ ".env.production" ];
             };
             unsupported =
               builtins.tryEval
@@ -96,6 +126,61 @@
                 assert builtins.any (package: package.key == "semver") fixture.passthru.kept;
                 assert builtins.any (package: package.key == "two/semver") fixture.passthru.kept;
                 pkgs.runCommand "bunix-kept" { } "touch $out";
+
+              members =
+                assert
+                  fixtureWorkspace.members == [
+                    {
+                      key = "one";
+                      source = "package/one";
+                    }
+                    {
+                      key = "two";
+                      source = "package/two";
+                    }
+                  ];
+                pkgs.runCommand "bunix-members" { } "touch $out";
+
+              # `src` holds the root manifests and the member trees, without
+              # local env files; `exclude` drops a name wherever it occurs.
+              source = pkgs.runCommand "bunix-source" { } ''
+                fail() { echo "bunix check: $*" >&2; exit 1; }
+                files() { (cd "$1" && find . -type f | sort | tr '\n' ' '); }
+                expected="./bun.lock ./package.json ./package/one/.env.production ./package/one/package.json ./package/two/package.json "
+                [ "$(files ${fixtureWorkspace.src})" = "$expected" ] \
+                  || fail "src holds $(files ${fixtureWorkspace.src})"
+                [ ! -e ${excluding.src}/package/one/.env.production ] \
+                  || fail "exclude kept package/one/.env.production"
+                [ -f ${excluding.src}/package/one/package.json ] \
+                  || fail "exclude dropped package/one/package.json"
+                touch $out
+              '';
+
+              # A build through `mkDerivation`: the root tree and member
+              # two's own node_modules are copied in, and each member
+              # resolves its own semver.
+              build = fixtureWorkspace.mkDerivation {
+                pname = "bunix-build";
+                version = "0.0.0";
+                buildPhase = ''
+                  fail() { echo "bunix check: $*" >&2; exit 1; }
+                  [ -f package/two/node_modules/semver/package.json ] \
+                    || fail "package/two/node_modules/semver/package.json was not copied"
+                  [ -d node_modules ] && [ ! -L node_modules ] || fail "node_modules is not a copied directory"
+                  [ ! -e .env.local ] || fail "src kept .env.local"
+                  [ ! -e package/one/.env.local ] || fail "src kept package/one/.env.local"
+                  [ -f package/one/.env.production ] || fail "src dropped package/one/.env.production"
+                  bun --version > /dev/null
+                  one=$(cd package/one && node -p "require('semver/package.json').version + ' ' + require('two/package.json').name")
+                  [ "$one" = "7.7.3 two" ] || fail "package/one resolves $one"
+                  two=$(cd package/two && node -p "require('semver/package.json').version")
+                  [ "$two" = "6.3.1" ] || fail "package/two resolves semver $two"
+                  node_modules/.bin/semver 1.2.3 > /dev/null || fail "node_modules/.bin/semver does not run"
+                '';
+                installPhase = ''
+                  echo "one: semver $one; two: semver $two" > $out
+                '';
+              };
 
               # Only evaluates when building the tree for the lock throws.
               unsupported-lockfile-version =

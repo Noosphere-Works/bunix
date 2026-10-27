@@ -15,43 +15,121 @@ does. No lifecycle scripts run.
 inputs.bunix.url = "github:noosphere-works/bunix";
 
 # with `pkgs` for the system being built
-bunDependencies = inputs.bunix.lib.nodeModules {
+bun = inputs.bunix.lib.workspace {
   inherit pkgs;
-  lock = ./bun.lock;
-  # name = "node-modules";  # the default
+  root = ./.; # the workspace root, next to bun.lock
+};
+
+app = bun.mkDerivation {
+  pname = "app";
+  version = "0.1.0";
+  buildPhase = "cd package/app && bun run build";
+  installPhase = "cp -R dist $out";
 };
 ```
 
-`lib.nodeModules { pkgs, lock, name ? "node-modules" }` works on any system.
-It uses only the `pkgs` you pass, never bunix's own nixpkgs input.
+Both functions work on any system. They use only the `pkgs` you pass, never
+bunix's own nixpkgs input.
 
-Copy the tree into the build's copy of the workspace. Don't link it.
-Workspace members are relative links, so they resolve only inside the
-project. A linked tree would also put its store path into the build's output.
-A workspace member with its own `node_modules` gets it under the same path in
-`$out` as in the project, so copy those too. The loop below fits members under
-`package/`; a project whose members live elsewhere copies from its own paths.
+## Workspace
+
+`lib.workspace { pkgs, root, lock ? root + "/bun.lock", exclude ? [ ], name ? "node-modules" }`
+returns:
+
+- `nodeModules`: the tree for the lock, `lib.nodeModules { inherit pkgs lock name; }`.
+- `members`: the lock's workspace members as `{ key, source }`, sorted by key.
+  `key` is the lock key (the member's name) and `source` its directory
+  relative to `root`, such as `{ key = "app"; source = "package/app"; }`. A
+  source that is absolute or has an empty, `.` or `..` segment stops
+  evaluation.
+- `src`: `root`, filtered down to what a build reads.
+- `mkDerivation`: `args: pkgs.stdenvNoCC.mkDerivation (bunArgs // args)`, with
+  the caller's `nativeBuildInputs` added to bunix's.
+- `bunArgs`: the defaults `mkDerivation` starts from, for
+  `pkgs.stdenvNoCC.mkDerivation (bun.bunArgs // { ... })` or another builder.
+- `copyNodeModules`: the shell snippet the default `configurePhase` runs.
+
+### `src`
+
+`src` is a `lib.cleanSourceWith` over `lib.cleanSource root`, so what
+`cleanSource` drops (version control directories, `result` links, editor
+backups) stays out too. It keeps:
+
+- at the root: `package.json`, `bun.lock`, `bunfig.toml` and every
+  `tsconfig*.json`
+- each member directory in `members`, wherever it lives, with everything in it
+
+Anywhere in those, it drops:
+
+- directories or files named `node_modules` or `dist`
+- files ending in `.tsbuildinfo`
+- the local env files bun and Vite load on a developer's machine: `.env`,
+  `.env.local` and `.env.<mode>.local`. Committed modes such as
+  `.env.production` stay.
+- every name in `exclude`. These are directory or file names, matched against
+  the last path component wherever it occurs, not paths:
+  `exclude = [ ".types" "coverage" ];`
+
+Everything else under `root` is left out: other root files, and directories
+that hold no member (a Rust crate next to the workspace, say).
+
+### `mkDerivation`
+
+The defaults are:
+
+- `src`: the filtered `src` above
+- `strictDeps = true`
+- `nativeBuildInputs = [ pkgs.bun pkgs.nodejs ]`. A caller's
+  `nativeBuildInputs` are appended, not substituted.
+- `configurePhase`: sets `HOME` and `BUN_INSTALL_CACHE_DIR` under `$TMPDIR`,
+  then runs `copyNodeModules`, between the `preConfigure` and `postConfigure`
+  hooks
+- `disallowedReferences = [ nodeModules ]`
+- `dontFixup = true`
+
+The caller supplies `pname`, `version`, `buildPhase` and `installPhase`, and
+any other attribute replaces the default. Add inputs through
+`nativeBuildInputs` or `buildInputs`, and steps through `preConfigure`,
+`postConfigure`, `preBuild` and the other hooks, which leave the copy in
+place. A caller's own `configurePhase` replaces the copy; splice the snippet
+back in to keep it:
 
 ```nix
-pkgs.stdenvNoCC.mkDerivation {
-  src = ./.; # the workspace root, next to bun.lock
-  nativeBuildInputs = [ pkgs.bun pkgs.nodejs ];
+bun.mkDerivation {
+  # ...
   configurePhase = ''
     runHook preConfigure
-    cp -R --reflink=auto ${bunDependencies}/node_modules node_modules
-    chmod -R u+w node_modules
-    for member in ${bunDependencies}/package/*; do
-      [ -d "$member/node_modules" ] || continue
-      target=package/$(basename "$member")/node_modules
-      cp -R --reflink=auto "$member/node_modules" "$target"
-      chmod -R u+w "$target"
-    done
+    ${bun.copyNodeModules}
+    # ...
     runHook postConfigure
   '';
-  disallowedReferences = [ bunDependencies ];
-  # ...
 }
 ```
+
+`copyNodeModules` runs from the source root. It copies the root tree to
+`node_modules`, then each member's own `node_modules`, where the lock gives it
+one, to `<member source>/node_modules`, and makes the copies writable. The
+tree is copied, never linked: workspace members are relative links that
+resolve only inside the project, and a linked tree's store path would end up
+in the build's output, which `disallowedReferences` refuses.
+
+### `nodeModules` alone
+
+`lib.nodeModules { pkgs, lock, name ? "node-modules" }` still builds the tree
+by itself, for a project that filters its own source and writes its own
+copy step:
+
+```nix
+bunDependencies = inputs.bunix.lib.nodeModules {
+  inherit pkgs;
+  lock = ./bun.lock;
+};
+```
+
+Copy `${bunDependencies}/node_modules` and each
+`${bunDependencies}/<member source>/node_modules` into the build's copy of the
+workspace, as `copyNodeModules` does, and set
+`disallowedReferences = [ bunDependencies ]`.
 
 ## Output
 
@@ -115,6 +193,17 @@ bunix stops at evaluation time with a `bunix:` message on:
 
 Lifecycle scripts (`preinstall`, `install`, `postinstall`) never run, so
 packages that build native code in those scripts won't work.
+
+## Versions
+
+`v0.2.0` adds `lib.workspace`. `lib.nodeModules` is unchanged from `v0.1.1`.
+
+## Checks
+
+`nix flake check` builds `fixture/`, a two-member workspace, through both
+functions. Its `.env.local`, `package/one/.env.local` and
+`package/one/.env.production` are test files for the `src` filter: the first
+two must be left out of `src`, the third kept.
 
 ## License
 
