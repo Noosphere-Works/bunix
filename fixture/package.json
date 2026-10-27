@@ -1,0 +1,5 @@
+{
+  "name": "bunix-fixture",
+  "private": true,
+  "workspaces": ["package/*"]
+}

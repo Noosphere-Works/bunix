@@ -1,0 +1,28 @@
+{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "bunix-fixture",
+    },
+    "package/one": {
+      "name": "one",
+      "version": "0.0.0",
+      "dependencies": {
+        "semver": "7.7.3",
+        "two": "workspace:*",
+      },
+    },
+    "package/two": {
+      "name": "two",
+      "version": "0.0.0",
+    },
+  },
+  "packages": {
+    "one": ["one@workspace:package/one"],
+
+    "semver": ["semver@7.7.3", "", { "bin": { "semver": "bin/semver.js" } }, "sha512-SdsKMrI9TdgjdweUSR9MweHA4EJ8YxHn8DFaDisvhVlUOe4BF1tLD7GAj0lIqWVl+dPb/rExr0Btby5loQm20Q=="],
+
+    "two": ["two@workspace:package/two"],
+  }
+}
