@@ -17,7 +17,10 @@ let
   # are relative links (`node_modules/app -> ../package/app`)
   # that only resolve inside the project, so a build copies the tree in
   # rather than linking it, which also keeps its store path out of what the
-  # build writes.
+  # build writes. Lock keys under a workspace member (`app/x`, where the
+  # member's version of `x` conflicts with the hoisted one) go to that
+  # member's own `node_modules`, under its source directory:
+  # `$out/package/app/node_modules/x`.
   #
   # The lock is read at evaluation time (no import-from-derivation). Every
   # registry tarball is a `fetchurl` pinned by the lock's own integrity
@@ -150,6 +153,33 @@ let
 
   isVersion = resolution: match "[0-9]+\\.[0-9]+\\.[0-9]+([-+][0-9A-Za-z.+-]*)?" resolution != null;
 
+  # The top-level workspace member a lock key sits under (`app` for
+  # `app/x/y`), or null for keys in the root tree.
+  memberOf =
+    segments:
+    let
+      top = if length segments > 1 then described.${head segments} or null else null;
+    in
+    if top != null && top.kind == "workspace" then top else null;
+
+  # The `node_modules` directory an entry's tree hangs from, relative to
+  # `$out`: the root's, or its workspace member's under the member's source.
+  modulesDir =
+    segments:
+    let
+      member = memberOf segments;
+      source = member.source;
+    in
+    if member == null then
+      "node_modules"
+    else if
+      lib.hasPrefix "/" source
+      || lib.any (part: part == "" || part == "." || part == "..") (lib.splitString "/" source)
+    then
+      fail "workspace member ${member.key} has source \"${source}\"; per-workspace node_modules need a relative source inside the project"
+    else
+      "${source}/node_modules";
+
   describe =
     key: entry:
     let
@@ -159,14 +189,17 @@ let
       resolution = elemAt parts 1;
       segments = keySegments key;
       parentKey = lib.concatStringsSep "/" (lib.init segments);
+      # The key's segments below its workspace member, if it has one.
+      inner = if memberOf segments == null then segments else lib.tail segments;
       common = {
         inherit key segments parentKey;
         name = packageName;
-        # Path inside node_modules: a/node_modules/b/node_modules/@s/c
-        path = lib.concatStringsSep "/node_modules/" segments;
-        # The node_modules directory holding it, relative to node_modules
-        # ("" at the top).
-        parentDir = lib.concatStringsSep "/" (map (segment: "${segment}/node_modules") (lib.init segments));
+        # Path inside the root's or the workspace member's node_modules:
+        # a/node_modules/b/node_modules/@s/c
+        path = lib.concatStringsSep "/node_modules/" inner;
+        # The node_modules directory holding it, relative to that
+        # node_modules ("" at the top).
+        parentDir = lib.concatStringsSep "/" (map (segment: "${segment}/node_modules") (lib.init inner));
       };
     in
     if parts == null then
@@ -254,11 +287,15 @@ let
         inherit target;
       }) bin;
 
+  # Paths in install lines are relative to `$out`.
   install =
     package:
     let
+      modules = modulesDir package.segments;
+      dir = "${modules}/${package.path}";
       binDir = lib.concatStringsSep "/" (
         lib.filter (part: part != "") [
+          modules
           package.parentDir
           ".bin"
         ]
@@ -273,7 +310,7 @@ let
           lib.escapeShellArgs [
             binDir
             bin.name
-            "${package.path}/${target}"
+            "${dir}/${target}"
             "../${ownDir}/${target}"
           ]
         }";
@@ -283,7 +320,7 @@ let
       # `node_modules/<name>`.
       "link_workspace ${
         lib.escapeShellArgs [
-          package.path
+          dir
           "${lib.concatStrings (lib.replicate (length (lib.splitString "/" package.path)) "../")}${package.source}"
         ]
       }"
@@ -293,7 +330,7 @@ let
           "unpack ${
             lib.escapeShellArgs [
               (tarball package)
-              package.path
+              dir
             ]
           }"
         ]
@@ -302,13 +339,27 @@ let
 
   # Every entry is classified (and unsupported sources throw) even when the
   # host platform drops it, so the lock fails the same way on every system.
+  # A registry package sits under a registry package or under a top-level
+  # workspace member, so by induction its chain ends in the root tree or in
+  # one member's node_modules.
   checked = lib.all (
     package:
+    let
+      parent = described.${package.parentKey} or null;
+    in
     (package.kind == "npm" || package.kind == "workspace")
     && (
       package.parentKey == ""
-      || package.kind == "npm" && (described.${package.parentKey} or { }).kind or null == "npm"
-      || fail "lock key ${package.key} sits under ${package.parentKey}, which is not a registry package in the lock; nested workspace members and per-workspace node_modules are not supported yet"
+      || (
+        if parent == null then
+          fail "lock key ${package.key} sits under ${package.parentKey}, which is not in the lock"
+        else if package.kind == "workspace" then
+          fail "lock key ${package.key} is a workspace member under ${package.parentKey}; nested workspace members are not supported yet"
+        else if parent.kind == "npm" || parent.kind == "workspace" && parent.parentKey == "" then
+          true
+        else
+          fail "lock key ${package.key} sits under workspace member ${package.parentKey}, which is itself nested; nested workspace members are not supported yet"
+      )
     )
   ) (lib.attrValues described);
 in
@@ -324,34 +375,35 @@ pkgs.stdenvNoCC.mkDerivation {
   bunPlatform = "${hostOs}-${hostCpu}";
 
   passAsFile = [ "buildCommand" ];
+  # Every path the functions take is relative to `$out`; link targets are
+  # relative to the link's own directory.
   buildCommand = ''
-    tree=$out/node_modules
-    mkdir -p "$tree"
+    mkdir -p "$out/node_modules"
 
     unpack() {
-      mkdir -p "$tree/$2"
-      tar -xzf "$1" -C "$tree/$2" --strip-components=1 --no-same-owner --no-same-permissions
-      chmod -R u+rwX "$tree/$2"
+      mkdir -p "$out/$2"
+      tar -xzf "$1" -C "$out/$2" --strip-components=1 --no-same-owner --no-same-permissions
+      chmod -R u+rwX "$out/$2"
     }
 
     link_bin() {
-      if [ ! -f "$tree/$3" ]; then
+      if [ ! -f "$out/$3" ]; then
         echo "bunix: skipping bin $2: $3 does not exist" >&2
         return
       fi
-      if [ -e "$tree/$1/$2" ] || [ -L "$tree/$1/$2" ]; then
+      if [ -e "$out/$1/$2" ] || [ -L "$out/$1/$2" ]; then
         echo "bunix: two packages install bin $1/$2" >&2
         exit 1
       fi
-      mkdir -p "$tree/$1"
-      chmod +x "$tree/$3"
-      patchShebangs --host "$tree/$3" > /dev/null
-      ln -s "$4" "$tree/$1/$2"
+      mkdir -p "$out/$1"
+      chmod +x "$out/$3"
+      patchShebangs --host "$out/$3" > /dev/null
+      ln -s "$4" "$out/$1/$2"
     }
 
     link_workspace() {
-      mkdir -p "$(dirname "$tree/$1")"
-      ln -s "$2" "$tree/$1"
+      mkdir -p "$(dirname "$out/$1")"
+      ln -s "$2" "$out/$1"
     }
 
     ${lib.concatMapStringsSep "\n" install kept}

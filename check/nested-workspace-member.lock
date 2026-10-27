@@ -1,0 +1,22 @@
+{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "bunix-nested",
+    },
+    "package/one": {
+      "name": "one",
+      "version": "0.0.0",
+    },
+    "package/two": {
+      "name": "two",
+      "version": "0.0.0",
+    },
+  },
+  "packages": {
+    "one": ["one@workspace:package/one"],
+
+    "one/two": ["two@workspace:package/two"],
+  }
+}

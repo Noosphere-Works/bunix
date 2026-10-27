@@ -42,15 +42,35 @@
                   inherit pkgs;
                   lock = ./check/unsupported-lockfile-version.lock;
                 }).drvPath;
+            nested =
+              builtins.tryEval
+                (nodeModules {
+                  inherit pkgs;
+                  lock = ./check/nested-workspace-member.lock;
+                }).drvPath;
           in
           {
             checks = {
               # The fixture's tree: relative workspace links, an unpacked
               # registry package, and a `.bin` link whose target runs
-              # through nixpkgs' node.
+              # through nixpkgs' node, in the root tree and in workspace
+              # member two's own node_modules (its semver conflicts with
+              # one's).
               tree = pkgs.runCommand "bunix-tree" { } ''
                 tree=${fixture}/node_modules
                 fail() { echo "bunix check: $*" >&2; exit 1; }
+                version() { grep -q "\"version\": \"$2\"" "$1/package.json" || fail "$1 is not version $2"; }
+                bin() {
+                  [ -L "$1/.bin/semver" ] || fail "$1/.bin/semver is not a link"
+                  [ "$(readlink "$1/.bin/semver")" = "../semver/bin/semver.js" ] \
+                    || fail "$1/.bin/semver links to $(readlink "$1/.bin/semver")"
+                  [ -x "$1/.bin/semver" ] || fail "$1/.bin/semver is not executable"
+                  shebang=$(head -n 1 "$1/.bin/semver")
+                  case "$shebang" in
+                    "#!${builtins.storeDir}/"*/bin/node) ;;
+                    *) fail "$1/.bin/semver starts with $shebang" ;;
+                  esac
+                }
 
                 for member in one two; do
                   [ -L "$tree/$member" ] || fail "$member is not a link"
@@ -59,29 +79,33 @@
                 done
 
                 [ -f "$tree/semver/package.json" ] || fail "semver/package.json is missing"
+                version "$tree/semver" 7.7.3
+                bin "$tree"
 
-                [ -L "$tree/.bin/semver" ] || fail ".bin/semver is not a link"
-                [ "$(readlink "$tree/.bin/semver")" = "../semver/bin/semver.js" ] \
-                  || fail ".bin/semver links to $(readlink "$tree/.bin/semver")"
-                [ -x "$tree/.bin/semver" ] || fail ".bin/semver is not executable"
-                shebang=$(head -n 1 "$tree/.bin/semver")
-                case "$shebang" in
-                  "#!${builtins.storeDir}/"*/bin/node) ;;
-                  *) fail ".bin/semver starts with $shebang" ;;
-                esac
+                member=${fixture}/package/two/node_modules
+                [ -f "$member/semver/package.json" ] \
+                  || fail "package/two/node_modules/semver/package.json is missing"
+                version "$member/semver" 6.3.1
+                bin "$member"
 
                 touch $out
               '';
 
               kept =
                 assert fixture.passthru.kept != [ ];
-                assert builtins.any (package: package.name == "semver") fixture.passthru.kept;
+                assert builtins.any (package: package.key == "semver") fixture.passthru.kept;
+                assert builtins.any (package: package.key == "two/semver") fixture.passthru.kept;
                 pkgs.runCommand "bunix-kept" { } "touch $out";
 
               # Only evaluates when building the tree for the lock throws.
               unsupported-lockfile-version =
                 assert !unsupported.success;
                 pkgs.runCommand "bunix-unsupported-lockfile-version" { } "touch $out";
+
+              # A workspace member under another member is refused.
+              nested-workspace-member =
+                assert !nested.success;
+                pkgs.runCommand "bunix-nested-workspace-member" { } "touch $out";
             };
 
             formatter = pkgs.nixfmt;

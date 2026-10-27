@@ -16,6 +16,9 @@
     "package/two": {
       "name": "two",
       "version": "0.0.0",
+      "dependencies": {
+        "semver": "6.3.1",
+      },
     },
   },
   "packages": {
@@ -24,5 +27,7 @@
     "semver": ["semver@7.7.3", "", { "bin": { "semver": "bin/semver.js" } }, "sha512-SdsKMrI9TdgjdweUSR9MweHA4EJ8YxHn8DFaDisvhVlUOe4BF1tLD7GAj0lIqWVl+dPb/rExr0Btby5loQm20Q=="],
 
     "two": ["two@workspace:package/two"],
+
+    "two/semver": ["semver@6.3.1", "", { "bin": { "semver": "bin/semver.js" } }, "sha512-BR7VvDCVHO+q2xBEWskxS6DJE1qRnb7DxzUrogb71CWoSficBxYsiAGd+Kl0mmq/MprG9yArRkyrQxTO6XjMzA=="],
   }
 }
