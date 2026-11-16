@@ -1,36 +1,39 @@
-# `pkgs`: the nixpkgs the tree is built with; its host platform picks the
-# optional native packages. `lock`: the path of a `bun.lock`. `name`: the
-# derivation name.
+# `pkgs`: the nixpkgs the tree is built with; its host platform is the
+# platform bun installs for. `root`: the workspace root, holding the root
+# `package.json`. `lock`: the path of its `bun.lock`. `name`: the derivation
+# name.
 {
   pkgs,
+  root,
   lock,
   name,
 }:
 let
-  # `bun.lock` as the hoisted `node_modules` tree bun's hoisted linker
-  # would write for the host platform of `pkgs`, with no network access at
-  # build time: what crane's `vendorCargoDeps` is to `Cargo.lock`.
+  # `bun.lock` as the hoisted `node_modules` tree bun writes for the host
+  # platform of `pkgs`, with no network access at build time: what crane's
+  # `vendorCargoDeps` is to `Cargo.lock`.
+  #
+  # bun writes the tree itself. The lock is read at evaluation time (no
+  # import-from-derivation), and every registry tarball it could install on
+  # the host is a `fetchurl` pinned by the lock's own integrity hash. The
+  # build serves those tarballs on 127.0.0.1 (`serve.js`) as the registry
+  # and runs `bun install --frozen-lockfile --linker hoisted
+  # --ignore-scripts` over the lock and the workspace's `package.json`
+  # files. A frozen install asks the registry only for tarballs, never for
+  # package metadata, so the lock is all bun needs.
   #
   # The tree is `$out/node_modules`, one level below `$out`, because Node
   # and Bun resolve a package's own imports from its real path, walking up
-  # through directories literally named `node_modules`. Workspace members
-  # are relative links (`node_modules/app -> ../package/app`)
-  # that only resolve inside the project, so a build copies the tree in
-  # rather than linking it, which also keeps its store path out of what the
-  # build writes. Lock keys under a workspace member (`app/x`, where the
-  # member's version of `x` conflicts with the hoisted one) go to that
-  # member's own `node_modules`, under its source directory:
-  # `$out/package/app/node_modules/x`.
+  # through directories literally named `node_modules`. A member's own
+  # `node_modules`, where bun gives it one, is under the member's source
+  # directory: `$out/package/app/node_modules`. Workspace members are
+  # relative links (`node_modules/app -> ../package/app`) that only resolve
+  # inside the project, so a build copies the tree in rather than linking
+  # it, which also keeps its store path out of what the build writes.
   #
-  # The lock is read at evaluation time (no import-from-derivation). Every
-  # registry tarball is a `fetchurl` pinned by the lock's own integrity
-  # hash, and the tree changes exactly when the lock does. No lifecycle
-  # scripts run. A tarball contributes its regular files, extracted as
-  # bun extracts them (`unpack.c`). The files `.bin` links point at get
-  # their `#!/usr/bin/env node` line patched to nixpkgs' `nodejs`: Nix
-  # sandboxes have no `/usr/bin/env`, and `bun <bin>` runs `.bin` entries
-  # through their shebangs. Every other file is byte-identical to its
-  # tarball entry.
+  # The files `.bin` links point at get their `#!/usr/bin/env node` line
+  # patched to nixpkgs' `nodejs`: Nix sandboxes have no `/usr/bin/env`, and
+  # `bun <bin>` runs `.bin` entries through their shebangs.
   inherit (pkgs) lib;
   inherit (builtins)
     elemAt
@@ -49,89 +52,11 @@ let
   # bun.lock is JSON plus trailing commas. Drop each comma that only
   # precedes a closing bracket; `builtins.split` returns the captured
   # bracket as a list.
-  lockText = builtins.readFile lock;
   parsed = fromJSON (
     lib.concatMapStrings (part: if isList part then head part else part) (
-      builtins.split ",([[:space:]]*[]}])" lockText
+      builtins.split ",([[:space:]]*[]}])" (builtins.readFile lock)
     )
   );
-
-  # Each `packages` entry's `bin` object as a flat list of its keys and
-  # targets, in lock order: `fromJSON` returns an object's keys sorted, but
-  # bun links a package's bins in the order its lock entry lists them. The
-  # lock text is split into JSON strings and structural characters, and a
-  # walk over them keeps the bracket depth: the root object is depth 1,
-  # `packages` 2, an entry's array 3, its metadata object 4 and `bin` 5.
-  binObjects =
-    let
-      tokens = lib.concatMap (part: if isList part then [ (head part) ] else [ ]) (
-        builtins.split "(\"([^\"\\\\]|\\\\.)*\"|[][{}:,])" lockText
-      );
-      step =
-        state: token:
-        let
-          next = state // {
-            previous = token;
-            beforePrevious = state.previous;
-          };
-        in
-        if token == "{" || token == "[" then
-          next
-          // {
-            depth = state.depth + 1;
-            bin =
-              if
-                state.section == "packages"
-                && state.depth == 4
-                && state.previous == ":"
-                && state.beforePrevious == "\"bin\""
-              then
-                [ ]
-              else
-                state.bin;
-          }
-        else if token == "}" || token == "]" then
-          next
-          // {
-            depth = state.depth - 1;
-            bin = if state.depth == 5 then null else state.bin;
-            found =
-              if state.bin != null && state.depth == 5 then
-                state.found
-                ++ [
-                  {
-                    name = state.entry;
-                    value = state.bin;
-                  }
-                ]
-              else
-                state.found;
-          }
-        else if token == ":" then
-          next
-          // (
-            if state.depth == 1 then
-              { section = fromJSON state.previous; }
-            else if state.depth == 2 then
-              { entry = fromJSON state.previous; }
-            else
-              { }
-          )
-        else if token == "," || state.bin == null then
-          next
-        else
-          next // { bin = state.bin ++ [ (fromJSON token) ]; };
-    in
-    builtins.listToAttrs
-      (lib.foldl' step {
-        depth = 0;
-        section = null;
-        entry = null;
-        previous = null;
-        beforePrevious = null;
-        bin = null;
-        found = [ ];
-      } tokens).found;
 
   # Bun 1.4 writes 2, or 3 when `overrides` holds scoped rules; `packages`
   # rows have the same shape from 1 on.
@@ -147,7 +72,8 @@ let
     else
       fail "unsupported lockfileVersion ${toString (parsed.lockfileVersion or "missing")} in bun.lock";
 
-  # Bun's names for process.platform and process.arch.
+  # Bun's names for process.platform and process.arch, which `bun install
+  # --os --cpu` takes.
   osNames = [
     "aix"
     "android"
@@ -187,10 +113,11 @@ let
     else
       fail "unsupported host platform ${hostPlatform.system}";
 
-  # Bun's `Negatable` rules: no field allows everything; "none" (what bun
-  # writes for values it does not know, such as wasm32) allows nothing;
-  # names allow those names; "!name" removes a name from whatever is
-  # allowed.
+  # Bun's `Negatable` rules for a package's own `os` or `cpu` field: no
+  # field allows everything; "none" (what bun writes for values it does not
+  # know, such as wasm32) allows nothing; names allow those names; "!name"
+  # removes a name from whatever is allowed. It only decides which tarballs
+  # Nix fetches; bun decides what it installs from them.
   allows =
     names: current: value:
     let
@@ -207,59 +134,11 @@ let
     else
       (added == [ ] || wildcard || lib.elem current added) && !lib.elem current removed;
 
-  # "@scope/a/b/@other/c" -> [ "@scope/a" "b" "@other/c" ]
-  keySegments =
-    key:
-    (lib.foldl'
-      (
-        acc: part:
-        if acc.scope != null then
-          {
-            scope = null;
-            segments = acc.segments ++ [ "${acc.scope}/${part}" ];
-          }
-        else if lib.hasPrefix "@" part then
-          acc // { scope = part; }
-        else
-          acc // { segments = acc.segments ++ [ part ]; }
-      )
-      {
-        scope = null;
-        segments = [ ];
-      }
-      (lib.splitString "/" key)
-    ).segments;
-
   unscoped = packageName: lib.last (lib.splitString "/" packageName);
 
   isVersion = resolution: match "[0-9]+\\.[0-9]+\\.[0-9]+([-+][0-9A-Za-z.+-]*)?" resolution != null;
 
-  # The top-level workspace member a lock key sits under (`app` for
-  # `app/x/y`), or null for keys in the root tree.
-  memberOf =
-    segments:
-    let
-      top = if length segments > 1 then described.${head segments} or null else null;
-    in
-    if top != null && top.kind == "workspace" then top else null;
-
-  # The `node_modules` directory an entry's tree hangs from, relative to
-  # `$out`: the root's, or its workspace member's under the member's source.
-  modulesDir =
-    segments:
-    let
-      member = memberOf segments;
-      source = member.source;
-    in
-    if member == null then
-      "node_modules"
-    else if
-      lib.hasPrefix "/" source
-      || lib.any (part: part == "" || part == "." || part == "..") (lib.splitString "/" source)
-    then
-      fail "workspace member ${member.key} has source \"${source}\"; per-workspace node_modules need a relative source inside the project"
-    else
-      "${source}/node_modules";
+  registryUrl = "https://registry.npmjs.org/";
 
   describe =
     key: entry:
@@ -268,47 +147,36 @@ let
       parts = match "(@?[^@]+)@(.*)" spec;
       packageName = elemAt parts 0;
       resolution = elemAt parts 1;
-      segments = keySegments key;
-      parentKey = lib.concatStringsSep "/" (lib.init segments);
-      # The key's segments below its workspace member, if it has one.
-      inner = if memberOf segments == null then segments else lib.tail segments;
-      common = {
-        inherit key segments parentKey;
-        name = packageName;
-        # Path inside the root's or the workspace member's node_modules:
-        # a/node_modules/b/node_modules/@s/c
-        path = lib.concatStringsSep "/node_modules/" inner;
-        # The node_modules directory holding it, relative to that
-        # node_modules ("" at the top).
-        parentDir = lib.concatStringsSep "/" (map (segment: "${segment}/node_modules") (lib.init inner));
-      };
     in
     if parts == null then
       fail "cannot parse \"${spec}\" (lock key ${key})"
     else if lib.hasPrefix "workspace:" resolution then
-      common
-      // {
+      {
+        inherit key;
         kind = "workspace";
         source = lib.removePrefix "workspace:" resolution;
       }
     else if isVersion resolution && length entry == 4 then
       let
         registry = elemAt entry 1;
-        meta = elemAt entry 2;
         integrity = elemAt entry 3;
       in
-      common
-      // {
+      {
+        inherit key;
         kind = "npm";
+        name = packageName;
         version = resolution;
-        inherit meta;
-        url =
+        meta = elemAt entry 2;
+        # The tarball's path under the registry, which bun asks the local
+        # registry for.
+        path =
           if registry == "" then
-            "https://registry.npmjs.org/${packageName}/-/${unscoped packageName}-${resolution}.tgz"
+            "${packageName}/-/${unscoped packageName}-${resolution}.tgz"
           else
             # Bun writes the full tarball URL when it is not under the
-            # default registry.
-            registry;
+            # default registry, and fetches that URL itself.
+            fail
+              "${packageName}@${resolution} (lock key ${key}) comes from ${registry}; only packages from ${registryUrl} are supported";
         integrity =
           if isString integrity && integrity != "" then
             integrity
@@ -320,252 +188,120 @@ let
 
   described = lib.mapAttrs describe packages;
 
-  # Keep an entry when its parent is kept, it is not bundled inside its
-  # parent's tarball, and its os/cpu fields admit the host.
-  keep = lib.mapAttrs (
-    key: package:
-    let
-      meta = package.meta or { };
-    in
-    (package.parentKey == "" || keep.${package.parentKey})
-    && !(meta.bundled or false)
-    && allows osNames hostOs (meta.os or [ ])
-    && allows cpuNames hostCpu (meta.cpu or [ ])
-  ) described;
-
-  kept = lib.sort (
-    a: b:
-    length a.segments < length b.segments || a.key < b.key && length a.segments == length b.segments
-  ) (lib.filter (package: keep.${package.key}) (lib.attrValues described));
-
-  tarball =
-    package:
-    pkgs.fetchurl {
-      name = "${lib.replaceStrings [ "@" "/" ] [ "" "+" ] package.name}-${package.version}.tgz";
-      inherit (package) url;
-      hash = package.integrity;
-    };
-
-  # A package's bins as bun's hoisted linker names and keeps them
-  # (`bin.rs`, `Linker.link`), in the order it links them. A string `bin`
-  # is named after the package's folder, which is the alias when there is
-  # one, unscoped (`Dependency::unscoped_package_name` of the dependency
-  # name). An object's keys are cut after their last `/`, `\` or `:`, and a
-  # key that leaves `""`, `.` or `..` is dropped (`normalized_bin_name`);
-  # its entries keep the lock's order (`binObjects`). A target that is
-  # empty or would resolve outside the package directory is dropped
-  # silently (`bin_target_escapes_package_dir`: absolute, a `:` in its
-  # first component, or `..` past the package root, splitting on `/` and
-  # `\`), so it never claims its `.bin` name. `path` is the target
-  # normalised the way bun joins it to the package directory: `.` and
-  # empty components go, and `..` takes the previous one off.
-  bins =
+  # Every workspace member in the lock, by lock key. The source is relative
+  # to the root, as in the lock.
+  members = map (
     package:
     let
-      bin = package.meta.bin or null;
-      ownDir = lib.last package.segments;
-      pairs = binObjects.${package.key} or (fail "found no bin object for lock key ${package.key}");
-      named =
-        if isString bin then
-          [
-            {
-              name = unscoped ownDir;
-              target = bin;
-            }
-          ]
-        else
-          lib.genList (i: {
-            name = lib.last (builtins.split "[/\\\\:]" (elemAt pairs (2 * i)));
-            target = elemAt pairs (2 * i + 1);
-          }) (length pairs / 2);
-      escapes =
-        target:
-        let
-          components = lib.filter isString (builtins.split "[/\\\\]" target);
-        in
-        lib.hasPrefix "/" target
-        || lib.hasInfix ":" (head components)
-        ||
-          lib.foldl' (
-            depth: component:
-            if depth < 0 || component == "" || component == "." then
-              depth
-            else if component == ".." then
-              depth - 1
-            else
-              depth + 1
-          ) 0 components < 0;
-      normalise =
-        target:
-        lib.foldl' (
-          kept: component:
-          if component == "" || component == "." then
-            kept
-          else if component == ".." then
-            lib.init kept
-          else
-            kept ++ [ component ]
-        ) [ ] (lib.splitString "/" target);
+      inherit (package) key source;
     in
-    if package.meta ? binDir then
-      fail "${package.name} links its bin directory (directories.bin), which is not supported yet"
-    else if bin == null then
-      [ ]
+    if
+      lib.hasPrefix "/" source
+      || lib.any (part: part == "" || part == "." || part == "..") (lib.splitString "/" source)
+    then
+      fail "workspace member ${key} has source \"${source}\"; a workspace needs member sources relative to the root and inside it"
     else
+      { inherit key source; }
+  ) (lib.filter (package: package.kind == "workspace") (lib.attrValues described));
+
+  # The tarballs bun may ask for on this host: every registry entry not
+  # bundled inside its parent's tarball whose own os/cpu fields admit the
+  # host. bun leaves out more (packages only an excluded package needs)
+  # and asks for none outside this set. One tarball can sit at several lock
+  # keys.
+  tarballs = lib.attrValues (
+    lib.listToAttrs (
       map
-        (entry: {
-          inherit (entry) name;
-          path = normalise entry.target;
+        (package: {
+          name = package.path;
+          value = package;
         })
         (
           lib.filter (
-            entry:
-            !lib.elem entry.name [
-              ""
-              "."
-              ".."
-            ]
-            && entry.target != ""
-            && !escapes entry.target
-          ) named
-        );
-
-  # The directory an entry is unpacked or linked at, relative to `$out`.
-  installDir = package: "${modulesDir package.segments}/${package.path}";
-
-  # Paths in install lines are relative to `$out`.
-  install =
-    package:
-    let
-      dir = installDir package;
-    in
-    if package.kind == "workspace" then
-      # Relative to the link's own directory: `../` per segment of
-      # `node_modules/<name>`.
-      "link_workspace ${
-        lib.escapeShellArgs [
-          dir
-          "${lib.concatStrings (lib.replicate (length (lib.splitString "/" package.path)) "../")}${package.source}"
-        ]
-      }"
-    else
-      "unpack ${
-        lib.escapeShellArgs [
-          (tarball package)
-          dir
-        ]
-      }";
-
-  # Every bin a kept registry package declares, with the `.bin` directory it
-  # goes in: the one beside the package, in the same node_modules.
-  binLinks = lib.concatMap (
-    package:
-    let
-      modules = modulesDir package.segments;
-      ownDir = lib.last package.segments;
-    in
-    map (bin: {
-      inherit ownDir;
-      binDir = lib.concatStringsSep "/" (
-        lib.filter (part: part != "") [
-          modules
-          package.parentDir
-          ".bin"
-        ]
-      );
-      inherit (bin) name;
-      file = lib.concatStringsSep "/" ([ (installDir package) ] ++ bin.path);
-      link = lib.concatStringsSep "/" (
-        [
-          ".."
-          ownDir
-        ]
-        ++ bin.path
-      );
-    }) (bins package)
-  ) (lib.filter (package: package.kind == "npm") kept);
-
-  # bun links a node_modules directory's bins in ascending byte order of
-  # the packages' folder names (a priority queue keyed by dependency name,
-  # `PackageInstaller.link_tree_bins`), and skips a `.bin` path it has
-  # already linked (`bin.Linker.link_bin_or_create_shim`); a bin whose
-  # target is missing is skipped without claiming the path, and one whose
-  # target is a directory claims it like a file. So each `.bin` path gets
-  # one `link_bin` with its candidates in that order, and the build links
-  # the first one whose target exists. `sort` is stable, so two bins of one
-  # name from one package stay in lock order, as `bins` lists them: the
-  # first whose target exists wins.
-  linkBins = lib.mapAttrsToList (
-    _: candidates:
-    let
-      ordered = lib.sort (a: b: a.ownDir < b.ownDir) candidates;
-      first = head ordered;
-    in
-    "link_bin ${
-      lib.escapeShellArgs (
-        [
-          first.binDir
-          first.name
-        ]
-        ++ lib.concatMap (candidate: [
-          candidate.file
-          candidate.link
-        ]) ordered
-      )
-    }"
-  ) (lib.groupBy (bin: "${bin.binDir}/${bin.name}") binLinks);
-
-  # Every entry is classified (and unsupported sources throw) even when the
-  # host platform drops it, so the lock fails the same way on every system.
-  # A registry package sits under a registry package or under a top-level
-  # workspace member, so by induction its chain ends in the root tree or in
-  # one member's node_modules.
-  checked = lib.all (
-    package:
-    let
-      parent = described.${package.parentKey} or null;
-    in
-    (package.kind == "npm" || package.kind == "workspace")
-    && (
-      package.parentKey == ""
-      || (
-        if parent == null then
-          fail "lock key ${package.key} sits under ${package.parentKey}, which is not in the lock"
-        else if package.kind == "workspace" then
-          fail "lock key ${package.key} is a workspace member under ${package.parentKey}; nested workspace members are not supported yet"
-        else if parent.kind == "npm" || parent.kind == "workspace" && parent.parentKey == "" then
-          true
-        else
-          fail "lock key ${package.key} sits under workspace member ${package.parentKey}, which is itself nested; nested workspace members are not supported yet"
-      )
+            package:
+            package.kind == "npm"
+            && !(package.meta.bundled or false)
+            && allows osNames hostOs (package.meta.os or [ ])
+            && allows cpuNames hostCpu (package.meta.cpu or [ ])
+          ) (lib.attrValues described)
+        )
     )
-  ) (lib.attrValues described);
+  );
 
-  unpacker = import ./unpack.nix { inherit pkgs; };
+  registry = pkgs.linkFarm "${name}-registry" (
+    map (package: {
+      name = package.path;
+      path = pkgs.fetchurl {
+        name = "${lib.replaceStrings [ "@" "/" ] [ "" "+" ] package.name}-${package.version}.tgz";
+        url = registryUrl + package.path;
+        hash = package.integrity;
+      };
+    }) tarballs
+  );
+
+  # The manifests a frozen install reads: the root's and each member's
+  # `package.json`, at their places in the workspace.
+  manifests = [ "package.json" ] ++ map (member: "${member.source}/package.json") members;
 in
-assert checked;
+# Every entry is classified, so an unsupported source fails on every
+# system, including entries this host never fetches.
+assert lib.all (package: package.kind == "npm" || package.kind == "workspace") (
+  lib.attrValues described
+);
 pkgs.stdenvNoCC.mkDerivation {
   inherit name;
 
-  nativeBuildInputs = [ unpacker ];
+  nativeBuildInputs = [ pkgs.bun ];
   # Resolves `#!/usr/bin/env node` in bin targets (patchShebangs --host).
   buildInputs = [ pkgs.nodejs ];
 
-  # The lock's hash ties the output to the lock byte for byte.
-  bunLock = builtins.hashFile "sha256" lock;
-  bunPlatform = "${hostOs}-${hostCpu}";
+  # The registry listens on 127.0.0.1, which macOS's sandbox blocks unless
+  # the build asks for local networking.
+  __darwinAllowLocalNetworking = true;
 
-  passAsFile = [ "buildCommand" ];
   buildCommand = ''
-    mkdir -p "$out/node_modules"
-    source ${./install.sh}
+    export HOME=$TMPDIR BUN_INSTALL_CACHE_DIR=$TMPDIR/bun-cache
+    mkdir -p "$out"
+    cd "$out"
+    cp ${lock} bun.lock
+    ${lib.concatMapStrings (manifest: ''
+      mkdir -p "$(dirname ${lib.escapeShellArg manifest})"
+      cp ${root + "/${manifest}"} ${lib.escapeShellArg manifest}
+    '') manifests}
 
-    ${lib.concatMapStringsSep "\n" install kept}
-    ${lib.concatStringsSep "\n" linkBins}
+    bun ${./serve.js} ${registry} "$TMPDIR/port" &
+    server=$!
+    while [ ! -s "$TMPDIR/port" ]; do
+      kill -0 $server || { echo "bunix: the local registry did not start" >&2; exit 1; }
+      sleep 0.1
+    done
+    BUN_CONFIG_REGISTRY="http://127.0.0.1:$(cat "$TMPDIR/port")/" bun install \
+      --frozen-lockfile --linker hoisted --ignore-scripts --backend copyfile \
+      --no-progress --no-summary --os ${hostOs} --cpu ${hostCpu}
+    kill $server
+
+    rm bun.lock
+    ${lib.concatMapStrings (manifest: ''
+      rm ${lib.escapeShellArg manifest}
+      rmdir -p --ignore-fail-on-non-empty "$(dirname ${lib.escapeShellArg manifest})" 2> /dev/null || true
+    '') manifests}
+
+    # Bin targets inside the tree; a workspace member's bins point into the
+    # project, which is not here.
+    targets=()
+    while IFS= read -r -d "" link; do
+      target=$(readlink -f "$link")
+      if [ -f "$target" ] && [[ $target == "$out"/* ]]; then
+        targets+=("$target")
+      fi
+    done < <(find "$out" -path '*/node_modules/.bin/*' -type l -print0)
+    if [ ''${#targets[@]} -gt 0 ]; then
+      patchShebangs --host "''${targets[@]}" > /dev/null
+    fi
   '';
 
   passthru = {
-    inherit kept;
+    inherit members registry;
     lockPackages = described;
   };
 }

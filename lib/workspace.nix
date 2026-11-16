@@ -16,28 +16,16 @@ let
   # source.
   inherit (pkgs) lib;
 
-  fail = message: throw "bunix: ${message}";
+  nodeModules = import ./node-modules.nix {
+    inherit
+      pkgs
+      root
+      lock
+      name
+      ;
+  };
 
-  nodeModules = import ./node-modules.nix { inherit pkgs lock name; };
-
-  # Every workspace member in the lock, by lock key. The source is relative
-  # to the root, as in the lock.
-  checkMember =
-    package:
-    let
-      inherit (package) key source;
-    in
-    if
-      lib.hasPrefix "/" source
-      || lib.any (part: part == "" || part == "." || part == "..") (lib.splitString "/" source)
-    then
-      fail "workspace member ${key} has source \"${source}\"; a workspace needs member sources relative to the root and inside it"
-    else
-      { inherit key source; };
-
-  members = map checkMember (
-    lib.filter (package: package.kind == "workspace") (lib.attrValues nodeModules.passthru.lockPackages)
-  );
+  inherit (nodeModules.passthru) members;
 
   sources = map (member: member.source) members;
 
