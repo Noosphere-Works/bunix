@@ -78,6 +78,25 @@
                   inherit pkgs;
                   lock = ./check/nested-workspace-member.lock;
                 }).drvPath;
+            # The `link_bin` lines for `check/bin-rules.lock`, whose entries
+            # carry the `package.json` files of local tarballs that bun
+            # 1.4.2's hoisted install linked as follows. `.bin/foo` went to
+            # twobin's `b.js`: its keys are `x/foo` then `foo`, and the first
+            # in lock order wins. names' keys `a:colon`, `b\back` and
+            # `q/w/deep` became colon, back and deep, and `dir/`, `.` and
+            # `..` were dropped. esc's `inner` (`sub/../a.js`) and `dots`
+            # (`./sub//./x.js`) linked normalised, and its `up`, `abs`,
+            # `drive` and `bs` targets, escstr's string target and aaa-esc's
+            # `../zzz-ok/tool.js` leave their package and were dropped, so
+            # `.bin/tool` went to zzz-ok. Each line lists a name's candidates
+            # in link order; every file exists, so the first is bun's link.
+            binLines = builtins.filter (pkgs.lib.hasPrefix "link_bin ") (
+              pkgs.lib.splitString "\n"
+                (nodeModules {
+                  inherit pkgs;
+                  lock = ./check/bin-rules.lock;
+                }).buildCommand
+            );
           in
           {
             checks = {
@@ -87,6 +106,9 @@
               # member two's own node_modules (its semver conflicts with
               # one's). node-uuid and uuid both declare bin `uuid`; bun
               # links the folder name that sorts first, node-uuid.
+              # `@babel/parser`'s `bin` is a string, and it is installed under
+              # the aliases `@bunix/parse` and `zz-parser`: bun names each
+              # link after the alias, unscoped, so there is no `parser`.
               tree = pkgs.runCommand "bunix-tree" { } ''
                 tree=${fixture}/node_modules
                 fail() { echo "bunix check: $*" >&2; exit 1; }
@@ -114,6 +136,10 @@
                 version "$tree/semver" 7.7.3
                 bin "$tree" semver ../semver/bin/semver.js
                 bin "$tree" uuid ../node-uuid/bin/uuid
+                bin "$tree" parse ../@bunix/parse/bin/babel-parser.js
+                bin "$tree" zz-parser ../zz-parser/bin/babel-parser.js
+                [ ! -e "$tree/.bin/parser" ] && [ ! -L "$tree/.bin/parser" ] \
+                  || fail "$tree/.bin/parser exists"
 
                 member=${fixture}/package/two/node_modules
                 [ -f "$member/semver/package.json" ] \
@@ -195,6 +221,21 @@
               nested-workspace-member =
                 assert !nested.success;
                 pkgs.runCommand "bunix-nested-workspace-member" { } "touch $out";
+
+              bin-rules =
+                assert
+                  binLines == [
+                    "link_bin node_modules/.bin back node_modules/names/a.js ../names/a.js"
+                    "link_bin node_modules/.bin colon node_modules/names/a.js ../names/a.js"
+                    "link_bin node_modules/.bin deep node_modules/names/a.js ../names/a.js"
+                    "link_bin node_modules/.bin dots node_modules/esc/sub/x.js ../esc/sub/x.js"
+                    "link_bin node_modules/.bin foo node_modules/twobin/b.js ../twobin/b.js node_modules/twobin/a.js ../twobin/a.js"
+                    "link_bin node_modules/.bin inner node_modules/esc/a.js ../esc/a.js"
+                    "link_bin node_modules/.bin ok node_modules/esc/a.js ../esc/a.js"
+                    "link_bin node_modules/.bin otherx node_modules/other/x.js ../other/x.js"
+                    "link_bin node_modules/.bin tool node_modules/zzz-ok/tool.js ../zzz-ok/tool.js"
+                  ];
+                pkgs.runCommand "bunix-bin-rules" { } "touch $out";
             };
 
             formatter = pkgs.nixfmt;

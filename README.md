@@ -152,14 +152,30 @@ package's imports from its real path, walking up through directories that are
 literally named `node_modules`. The files that `.bin` links point to are made
 executable, and their `#!/usr/bin/env node` line is patched to nixpkgs'
 `nodejs`, because Nix sandboxes have no `/usr/bin/env`. Everything else is
-byte-identical to the tarballs. A bin whose file is missing from its package
-is skipped with a warning. When packages in one `node_modules` declare the
-same bin name, the `.bin` link goes to the package whose folder name sorts
-first in byte order, as bun's hoisted install does: it links a directory's
-bins in that order and skips a `.bin` path it has already linked. A package
-whose bin file is missing does not claim the name. So `@playwright/test` wins
-`.bin/playwright` over `playwright`, and an alias `zz-pw` for
-`@playwright/test` would lose it to `playwright`.
+byte-identical to the tarballs.
+
+Bins are named and linked as bun's hoisted install does:
+
+- A string `bin` is named after the package's folder, unscoped. Under an
+  alias that is the alias: `"zz-parser": "npm:@babel/parser@…"` links
+  `.bin/zz-parser`, and `"@bunix/parse": "npm:@babel/parser@…"` links
+  `.bin/parse`.
+- An object's keys are cut after their last `/`, `\` or `:`, so `x/foo` links
+  `.bin/foo`. A key that leaves nothing, `.` or `..` is dropped.
+- A target that is empty or would resolve outside its package (an absolute
+  path, a `:` in its first component, or `..` past the package root) is
+  dropped without a warning. Other targets are normalised, so
+  `./bin//cli.js` links `../<name>/bin/cli.js`.
+- A bin whose file is missing from its package is skipped with a warning.
+- When several bins in one `node_modules` share a name, the `.bin` link goes
+  to the first that is not dropped and whose file exists. Packages come in
+  byte order of their folder names, and one package's bins in the order its
+  lock entry lists them; bun links a directory's bins in that order and skips
+  a `.bin` path it has already linked. So `@playwright/test` wins
+  `.bin/playwright` over `playwright`, an alias `zz-pw` for
+  `@playwright/test` would lose it to `playwright`, and in
+  `"bin": { "x/foo": "b.js", "foo": "a.js" }` the first key wins `.bin/foo`.
+  A dropped or missing bin does not claim the name.
 
 `passthru.kept` lists the lock entries in the tree for this host.
 `passthru.lockPackages` holds every lock entry, classified.
@@ -208,7 +224,11 @@ packages that build native code in those scripts won't work.
 `nix flake check` builds `fixture/`, a two-member workspace, through both
 functions. Its `.env.local`, `package/one/.env.local` and
 `package/one/.env.production` are test files for the `src` filter: the first
-two must be left out of `src`, the third kept.
+two must be left out of `src`, the third kept. `check/bin-rules.lock` holds
+bin shapes no registry package in the fixture shows (keys that share a final
+name, keys to cut or drop, targets outside the package), and its check
+compares the `.bin` links bunix plans with the ones bun linked for the same
+`package.json` files.
 
 ## License
 

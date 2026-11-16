@@ -32,6 +32,7 @@ let
   inherit (pkgs) lib;
   inherit (builtins)
     elemAt
+    fromJSON
     head
     isList
     isString
@@ -46,11 +47,89 @@ let
   # bun.lock is JSON plus trailing commas. Drop each comma that only
   # precedes a closing bracket; `builtins.split` returns the captured
   # bracket as a list.
-  parsed = builtins.fromJSON (
+  lockText = builtins.readFile lock;
+  parsed = fromJSON (
     lib.concatMapStrings (part: if isList part then head part else part) (
-      builtins.split ",([[:space:]]*[]}])" (builtins.readFile lock)
+      builtins.split ",([[:space:]]*[]}])" lockText
     )
   );
+
+  # Each `packages` entry's `bin` object as a flat list of its keys and
+  # targets, in lock order: `fromJSON` returns an object's keys sorted, but
+  # bun links a package's bins in the order its lock entry lists them. The
+  # lock text is split into JSON strings and structural characters, and a
+  # walk over them keeps the bracket depth: the root object is depth 1,
+  # `packages` 2, an entry's array 3, its metadata object 4 and `bin` 5.
+  binObjects =
+    let
+      tokens = lib.concatMap (part: if isList part then [ (head part) ] else [ ]) (
+        builtins.split "(\"([^\"\\\\]|\\\\.)*\"|[][{}:,])" lockText
+      );
+      step =
+        state: token:
+        let
+          next = state // {
+            previous = token;
+            beforePrevious = state.previous;
+          };
+        in
+        if token == "{" || token == "[" then
+          next
+          // {
+            depth = state.depth + 1;
+            bin =
+              if
+                state.section == "packages"
+                && state.depth == 4
+                && state.previous == ":"
+                && state.beforePrevious == "\"bin\""
+              then
+                [ ]
+              else
+                state.bin;
+          }
+        else if token == "}" || token == "]" then
+          next
+          // {
+            depth = state.depth - 1;
+            bin = if state.depth == 5 then null else state.bin;
+            found =
+              if state.bin != null && state.depth == 5 then
+                state.found
+                ++ [
+                  {
+                    name = state.entry;
+                    value = state.bin;
+                  }
+                ]
+              else
+                state.found;
+          }
+        else if token == ":" then
+          next
+          // (
+            if state.depth == 1 then
+              { section = fromJSON state.previous; }
+            else if state.depth == 2 then
+              { entry = fromJSON state.previous; }
+            else
+              { }
+          )
+        else if token == "," || state.bin == null then
+          next
+        else
+          next // { bin = state.bin ++ [ (fromJSON token) ]; };
+    in
+    builtins.listToAttrs
+      (lib.foldl' step {
+        depth = 0;
+        section = null;
+        entry = null;
+        previous = null;
+        beforePrevious = null;
+        bin = null;
+        found = [ ];
+      } tokens).found;
 
   # Bun 1.4 writes 2, or 3 when `overrides` holds scoped rules; `packages`
   # rows have the same shape from 1 on.
@@ -265,27 +344,89 @@ let
       hash = package.integrity;
     };
 
+  # A package's bins as bun's hoisted linker names and keeps them
+  # (`bin.rs`, `Linker.link`), in the order it links them. A string `bin`
+  # is named after the package's folder, which is the alias when there is
+  # one, unscoped (`Dependency::unscoped_package_name` of the dependency
+  # name). An object's keys are cut after their last `/`, `\` or `:`, and a
+  # key that leaves `""`, `.` or `..` is dropped (`normalized_bin_name`);
+  # its entries keep the lock's order (`binObjects`). A target that is
+  # empty or would resolve outside the package directory is dropped
+  # silently (`bin_target_escapes_package_dir`: absolute, a `:` in its
+  # first component, or `..` past the package root, splitting on `/` and
+  # `\`), so it never claims its `.bin` name. `path` is the target
+  # normalised the way bun joins it to the package directory: `.` and
+  # empty components go, and `..` takes the previous one off.
   bins =
     package:
     let
       bin = package.meta.bin or null;
+      ownDir = lib.last package.segments;
+      pairs = binObjects.${package.key} or (fail "found no bin object for lock key ${package.key}");
+      named =
+        if isString bin then
+          [
+            {
+              name = unscoped ownDir;
+              target = bin;
+            }
+          ]
+        else
+          lib.genList (i: {
+            name = lib.last (builtins.split "[/\\\\:]" (elemAt pairs (2 * i)));
+            target = elemAt pairs (2 * i + 1);
+          }) (length pairs / 2);
+      escapes =
+        target:
+        let
+          components = lib.filter isString (builtins.split "[/\\\\]" target);
+        in
+        lib.hasPrefix "/" target
+        || lib.hasInfix ":" (head components)
+        ||
+          lib.foldl' (
+            depth: component:
+            if depth < 0 || component == "" || component == "." then
+              depth
+            else if component == ".." then
+              depth - 1
+            else
+              depth + 1
+          ) 0 components < 0;
+      normalise =
+        target:
+        lib.foldl' (
+          kept: component:
+          if component == "" || component == "." then
+            kept
+          else if component == ".." then
+            lib.init kept
+          else
+            kept ++ [ component ]
+        ) [ ] (lib.splitString "/" target);
     in
     if package.meta ? binDir then
       fail "${package.name} links its bin directory (directories.bin), which is not supported yet"
     else if bin == null then
       [ ]
-    else if isString bin then
-      [
-        {
-          name = unscoped package.name;
-          target = bin;
-        }
-      ]
     else
-      lib.mapAttrsToList (binName: target: {
-        name = baseNameOf binName;
-        inherit target;
-      }) bin;
+      map
+        (entry: {
+          inherit (entry) name;
+          path = normalise entry.target;
+        })
+        (
+          lib.filter (
+            entry:
+            !lib.elem entry.name [
+              ""
+              "."
+              ".."
+            ]
+            && entry.target != ""
+            && !escapes entry.target
+          ) named
+        );
 
   # The directory an entry is unpacked or linked at, relative to `$out`.
   installDir = package: "${modulesDir package.segments}/${package.path}";
@@ -321,25 +462,25 @@ let
       modules = modulesDir package.segments;
       ownDir = lib.last package.segments;
     in
-    map (
-      bin:
-      let
-        target = lib.removePrefix "./" bin.target;
-      in
-      {
-        inherit ownDir;
-        binDir = lib.concatStringsSep "/" (
-          lib.filter (part: part != "") [
-            modules
-            package.parentDir
-            ".bin"
-          ]
-        );
-        inherit (bin) name;
-        file = "${installDir package}/${target}";
-        link = "../${ownDir}/${target}";
-      }
-    ) (bins package)
+    map (bin: {
+      inherit ownDir;
+      binDir = lib.concatStringsSep "/" (
+        lib.filter (part: part != "") [
+          modules
+          package.parentDir
+          ".bin"
+        ]
+      );
+      inherit (bin) name;
+      file = lib.concatStringsSep "/" ([ (installDir package) ] ++ bin.path);
+      link = lib.concatStringsSep "/" (
+        [
+          ".."
+          ownDir
+        ]
+        ++ bin.path
+      );
+    }) (bins package)
   ) (lib.filter (package: package.kind == "npm") kept);
 
   # bun links a node_modules directory's bins in ascending byte order of
@@ -349,7 +490,8 @@ let
   # is missing is skipped without claiming the path. So each `.bin` path
   # gets one `link_bin` with its candidates in that order, and the build
   # links the first one whose file exists. `sort` is stable, so two bins of
-  # one name from one package stay in the order `bins` lists them.
+  # one name from one package stay in lock order, as `bins` lists them: the
+  # first whose file exists wins.
   linkBins = lib.mapAttrsToList (
     _: candidates:
     let

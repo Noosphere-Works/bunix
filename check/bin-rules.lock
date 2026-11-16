@@ -1,0 +1,33 @@
+{
+  "lockfileVersion": 2,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "bunix-bin-rules",
+      "dependencies": {
+        "aaa-esc": "1.0.0",
+        "esc": "1.0.0",
+        "escstr": "1.0.0",
+        "names": "1.0.0",
+        "other": "1.0.0",
+        "twobin": "1.0.0",
+        "zzz-ok": "1.0.0",
+      },
+    },
+  },
+  "packages": {
+    "aaa-esc": ["aaa-esc@1.0.0", "", { "bin": { "tool": "../zzz-ok/tool.js" } }, "sha512-A9YSNBkv/pfDSK5Dp758/+w4M34zWggOQsrVVxx23z/uR1cuWaot1GAIe7KTj5xBYnTAA2F/4+RpDnQEpFrLbA=="],
+
+    "esc": ["esc@1.0.0", "", { "bin": { "up": "../other/x.js", "abs": "/bin/sh", "drive": "C:x.js", "bs": "a\\..\\..\\other\\x.js", "inner": "sub/../a.js", "dots": "./sub//./x.js", "ok": "a.js" } }, "sha512-XlMOCicID5ItJnCbagnvoyTN/SH1/MIDbnUpat9yRInqfTEyVykzg2yepV+jZ3VEj3RBBb0QKgPUceFVcPaqpQ=="],
+
+    "escstr": ["escstr@1.0.0", "", { "bin": "../other/x.js" }, "sha512-6kcVzm0F5esW9nEZZheNmaCsYrY/OYchBfVL9K2B9b+lcSpaGr7RK5acPPwWUva7Of4bsXanDWgCQmIv+LqyOg=="],
+
+    "names": ["names@1.0.0", "", { "bin": { "a:colon": "a.js", "b\\back": "a.js", "dir/": "a.js", "..": "a.js", ".": "a.js", "q/w/deep": "a.js" } }, "sha512-rR3NDd3JAht7u+PmAwmIoriYiOs8epDcaL4+zZFPcIBd4SAXjZf6wN1FkZUrXdoYdmGm+ZUmQWVhDmpaJQ7ytQ=="],
+
+    "other": ["other@1.0.0", "", { "bin": { "otherx": "x.js" } }, "sha512-QGR64ikJ42uLnF69yNuuCLZUHTVtSnrpbt4iv1LU9Rqjo1Ei8ws0U+4rebzAYz2oljwXUeH0HFTyJwk/AQVRmQ=="],
+
+    "twobin": ["twobin@1.0.0", "", { "bin": { "x/foo": "b.js", "foo": "a.js" } }, "sha512-875SxP231irjDC5/jITnuo43zre6EyvgIRydrtBwvnLABugAVhiA1ZPDBpn5xnd9q3rAELoFN8TD07vghAhuhg=="],
+
+    "zzz-ok": ["zzz-ok@1.0.0", "", { "bin": { "tool": "tool.js" } }, "sha512-KrVtxetZLG4+DwVTi/mp/UD94V7KivtqcvwyTLaHScH24wjuitWBnuaTAgmzJpFONfAvkiBDQWe93YgJa2lH+w=="],
+  }
+}

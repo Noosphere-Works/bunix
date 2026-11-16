@@ -3,9 +3,11 @@
   "version": "0.0.0",
   "private": true,
   "dependencies": {
+    "@bunix/parse": "npm:@babel/parser@7.29.14",
     "node-uuid": "1.4.8",
     "semver": "7.7.3",
     "two": "workspace:*",
-    "uuid": "11.1.0"
+    "uuid": "11.1.0",
+    "zz-parser": "npm:@babel/parser@7.29.14"
   }
 }
