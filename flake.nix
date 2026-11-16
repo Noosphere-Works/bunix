@@ -90,13 +90,17 @@
             # `../zzz-ok/tool.js` leave their package and were dropped, so
             # `.bin/tool` went to zzz-ok. Each line lists a name's candidates
             # in link order; every file exists, so the first is bun's link.
-            binLines = builtins.filter (pkgs.lib.hasPrefix "link_bin ") (
-              pkgs.lib.splitString "\n"
-                (nodeModules {
-                  inherit pkgs;
-                  lock = ./check/bin-rules.lock;
-                }).buildCommand
-            );
+            binLines = linkBinLines ./check/bin-rules.lock;
+            # A lock's `link_bin` lines. They name only paths under `$out`, so
+            # they drop the build command's context, which holds the lock's
+            # tarball downloads.
+            linkBinLines =
+              lock:
+              builtins.filter (pkgs.lib.hasPrefix "link_bin ") (
+                pkgs.lib.splitString "\n" (
+                  builtins.unsafeDiscardStringContext (nodeModules { inherit pkgs lock; }).buildCommand
+                )
+              );
           in
           {
             checks = {
@@ -221,6 +225,43 @@
               nested-workspace-member =
                 assert !nested.success;
                 pkgs.runCommand "bunix-nested-workspace-member" { } "touch $out";
+
+              # `check/entry-kinds/` holds three tarballs and a lock for them.
+              # The tree bun 1.4.2's hoisted install made from them is
+              # `expected`; this check unpacks them with bunix's own `unpack`,
+              # runs the lock's `link_bin` lines, and lists the result the
+              # same way. bun writes only a tarball's regular files: no
+              # symlinks (inside or outside the package), directories other
+              # than a file's parents, FIFOs, devices, or hard links without
+              # a body, while a pax hard link with a body, a hard link with a
+              # size, contiguous and unknown entry types are files, and an
+              # AppleDouble `._` entry is metadata for the next one. It drops
+              # the first path component, normalises the rest with `..`
+              # stopping at the package root, reads past zero blocks, and
+              # creates a file with mode (permissions & 0777) | 0666, which a
+              # later entry for the same path truncates. kinds' `bindir` bin
+              # is a directory; it claims `.bin/dirbin` ahead of zkinds' file.
+              # Its `in-link.js`, `lib-out/x.js` and `hard.js` bins were
+              # symlinks or a hard link, so `.bin/inbin` went to zkinds.
+              entry-kinds =
+                pkgs.runCommand "bunix-entry-kinds"
+                  {
+                    nativeBuildInputs = [ (import ./lib/unpack.nix { inherit pkgs; }) ];
+                    buildInputs = [ pkgs.nodejs ];
+                  }
+                  ''
+                    source ${./lib/install.sh}
+                    for package in edge kinds zkinds; do
+                      unpack ${./check/entry-kinds}/$package.tgz node_modules/$package
+                    done
+                    ${pkgs.lib.concatStringsSep "\n" (linkBinLines ./check/entry-kinds/bun.lock)}
+                    listing=$(cd $out/node_modules && find . -mindepth 1 | LC_ALL=C sort | while IFS= read -r f; do
+                      if [ -L "$f" ]; then echo "L $f -> $(readlink "$f")"
+                      elif [ -d "$f" ]; then echo "D $f"
+                      else echo "F $f $(stat -c %a "$f") $(sha256sum < "$f" | cut -c1-16)"; fi
+                    done)
+                    diff -u ${./check/entry-kinds/expected} <(echo "$listing")
+                  '';
 
               bin-rules =
                 assert

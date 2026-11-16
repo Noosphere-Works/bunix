@@ -134,7 +134,7 @@ workspace, as `copyNodeModules` does, and set
 ## Output
 
 ```
-$out/node_modules/<name>/                      registry tarball, unpacked
+$out/node_modules/<name>/                      registry tarball's files, unpacked
 $out/node_modules/<a>/node_modules/<b>/        nested copy, where the lock puts one
 $out/node_modules/.bin/<bin> -> ../<name>/<file>
 $out/node_modules/<member> -> ../package/<member>   workspace member, relative link
@@ -149,10 +149,29 @@ directory under `$out` is the member's source path from the lock, so
 
 The tree is `$out/node_modules`, not `$out`, because Node and Bun resolve a
 package's imports from its real path, walking up through directories that are
-literally named `node_modules`. The files that `.bin` links point to are made
-executable, and their `#!/usr/bin/env node` line is patched to nixpkgs'
-`nodejs`, because Nix sandboxes have no `/usr/bin/env`. Everything else is
-byte-identical to the tarballs.
+literally named `node_modules`. The targets of `.bin` links get mode 0777
+minus the umask, as bun gives them, and a file target's `#!/usr/bin/env node`
+line is patched to nixpkgs' `nodejs`, because Nix sandboxes have no
+`/usr/bin/env`. Every other file is byte-identical to its tarball entry.
+
+Tarballs are extracted as bun's installer extracts them, by a small helper
+(`lib/unpack.c`) built on libarchive, the library bun uses, running bun's
+extraction loop:
+
+- Only regular files are written. Symlinks, whether they point inside the
+  package or out of it, directories, FIFOs, devices and hard links without a
+  body are skipped, so a directory exists only to hold a file. A pax hard
+  link with a body, a hard link entry with a size, and contiguous or unknown
+  entry types are regular files, as libarchive reads them. A macOS
+  AppleDouble entry (`._name`) is metadata for the entry after it, not a
+  file.
+- The first path component (`package/`) is dropped and the rest normalised:
+  `.` and repeated `/` go, and `..` takes off the component before it, but
+  never climbs out of the package. An entry that leaves no path is skipped.
+- Zero blocks do not end the archive; entries after them are read too.
+- A file is created with mode (entry permissions & 0777) | 0666 under the
+  umask. A later entry for the same path replaces its contents and keeps the
+  first entry's mode.
 
 Bins are named and linked as bun's hoisted install does:
 
@@ -166,9 +185,11 @@ Bins are named and linked as bun's hoisted install does:
   path, a `:` in its first component, or `..` past the package root) is
   dropped without a warning. Other targets are normalised, so
   `./bin//cli.js` links `../<name>/bin/cli.js`.
-- A bin whose file is missing from its package is skipped with a warning.
+- A bin whose target is missing from its package (including one that was a
+  symlink or hard link in the tarball) is skipped with a warning. A target
+  that is a directory is linked like a file.
 - When several bins in one `node_modules` share a name, the `.bin` link goes
-  to the first that is not dropped and whose file exists. Packages come in
+  to the first that is not dropped and whose target exists. Packages come in
   byte order of their folder names, and one package's bins in the order its
   lock entry lists them; bun links a directory's bins in that order and skips
   a `.bin` path it has already linked. So `@playwright/test` wins
@@ -228,7 +249,11 @@ two must be left out of `src`, the third kept. `check/bin-rules.lock` holds
 bin shapes no registry package in the fixture shows (keys that share a final
 name, keys to cut or drop, targets outside the package), and its check
 compares the `.bin` links bunix plans with the ones bun linked for the same
-`package.json` files.
+`package.json` files. `check/entry-kinds/` holds tarballs with entry kinds and
+path shapes npm packages rarely show (symlinks, hard links, FIFOs, devices,
+directory bins, long and `..` paths), a lock for them, and the tree bun made
+from them; its check unpacks and links them with bunix's own functions and
+compares the trees.
 
 ## License
 

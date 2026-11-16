@@ -25,10 +25,12 @@ let
   # The lock is read at evaluation time (no import-from-derivation). Every
   # registry tarball is a `fetchurl` pinned by the lock's own integrity
   # hash, and the tree changes exactly when the lock does. No lifecycle
-  # scripts run. The files `.bin` links point at get their
-  # `#!/usr/bin/env node` line patched to nixpkgs' `nodejs`: Nix sandboxes
-  # have no `/usr/bin/env`, and `bun <bin>` runs `.bin` entries through
-  # their shebangs. Everything else is byte-identical to the tarballs.
+  # scripts run. A tarball contributes its regular files, extracted as
+  # bun extracts them (`unpack.c`). The files `.bin` links point at get
+  # their `#!/usr/bin/env node` line patched to nixpkgs' `nodejs`: Nix
+  # sandboxes have no `/usr/bin/env`, and `bun <bin>` runs `.bin` entries
+  # through their shebangs. Every other file is byte-identical to its
+  # tarball entry.
   inherit (pkgs) lib;
   inherit (builtins)
     elemAt
@@ -486,12 +488,13 @@ let
   # bun links a node_modules directory's bins in ascending byte order of
   # the packages' folder names (a priority queue keyed by dependency name,
   # `PackageInstaller.link_tree_bins`), and skips a `.bin` path it has
-  # already linked (`bin.Linker.link_bin_or_create_shim`); a bin whose file
-  # is missing is skipped without claiming the path. So each `.bin` path
-  # gets one `link_bin` with its candidates in that order, and the build
-  # links the first one whose file exists. `sort` is stable, so two bins of
-  # one name from one package stay in lock order, as `bins` lists them: the
-  # first whose file exists wins.
+  # already linked (`bin.Linker.link_bin_or_create_shim`); a bin whose
+  # target is missing is skipped without claiming the path, and one whose
+  # target is a directory claims it like a file. So each `.bin` path gets
+  # one `link_bin` with its candidates in that order, and the build links
+  # the first one whose target exists. `sort` is stable, so two bins of one
+  # name from one package stay in lock order, as `bins` lists them: the
+  # first whose target exists wins.
   linkBins = lib.mapAttrsToList (
     _: candidates:
     let
@@ -537,11 +540,14 @@ let
       )
     )
   ) (lib.attrValues described);
+
+  unpacker = import ./unpack.nix { inherit pkgs; };
 in
 assert checked;
 pkgs.stdenvNoCC.mkDerivation {
   inherit name;
 
+  nativeBuildInputs = [ unpacker ];
   # Resolves `#!/usr/bin/env node` in bin targets (patchShebangs --host).
   buildInputs = [ pkgs.nodejs ];
 
@@ -550,40 +556,9 @@ pkgs.stdenvNoCC.mkDerivation {
   bunPlatform = "${hostOs}-${hostCpu}";
 
   passAsFile = [ "buildCommand" ];
-  # Every path the functions take is relative to `$out`; link targets are
-  # relative to the link's own directory.
   buildCommand = ''
     mkdir -p "$out/node_modules"
-
-    unpack() {
-      mkdir -p "$out/$2"
-      tar -xzf "$1" -C "$out/$2" --strip-components=1 --no-same-owner --no-same-permissions
-      chmod -R u+rwX "$out/$2"
-    }
-
-    # link_bin <.bin dir> <name> (<file> <link target>)...: links the first
-    # candidate whose file exists.
-    link_bin() {
-      dir=$1
-      name=$2
-      shift 2
-      while [ $# -gt 0 ]; do
-        if [ -f "$out/$1" ]; then
-          mkdir -p "$out/$dir"
-          chmod +x "$out/$1"
-          patchShebangs --host "$out/$1" > /dev/null
-          ln -s "$2" "$out/$dir/$name"
-          return
-        fi
-        echo "bunix: skipping bin $name: $1 does not exist" >&2
-        shift 2
-      done
-    }
-
-    link_workspace() {
-      mkdir -p "$(dirname "$out/$1")"
-      ln -s "$2" "$out/$1"
-    }
+    source ${./install.sh}
 
     ${lib.concatMapStringsSep "\n" install kept}
     ${lib.concatStringsSep "\n" linkBins}
