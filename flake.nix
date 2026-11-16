@@ -85,20 +85,22 @@
               # registry package, and a `.bin` link whose target runs
               # through nixpkgs' node, in the root tree and in workspace
               # member two's own node_modules (its semver conflicts with
-              # one's).
+              # one's). node-uuid and uuid both declare bin `uuid`; bun
+              # links the folder name that sorts first, node-uuid.
               tree = pkgs.runCommand "bunix-tree" { } ''
                 tree=${fixture}/node_modules
                 fail() { echo "bunix check: $*" >&2; exit 1; }
                 version() { grep -q "\"version\": \"$2\"" "$1/package.json" || fail "$1 is not version $2"; }
+                # bin <node_modules> <name> <link target>
                 bin() {
-                  [ -L "$1/.bin/semver" ] || fail "$1/.bin/semver is not a link"
-                  [ "$(readlink "$1/.bin/semver")" = "../semver/bin/semver.js" ] \
-                    || fail "$1/.bin/semver links to $(readlink "$1/.bin/semver")"
-                  [ -x "$1/.bin/semver" ] || fail "$1/.bin/semver is not executable"
-                  shebang=$(head -n 1 "$1/.bin/semver")
+                  [ -L "$1/.bin/$2" ] || fail "$1/.bin/$2 is not a link"
+                  [ "$(readlink "$1/.bin/$2")" = "$3" ] \
+                    || fail "$1/.bin/$2 links to $(readlink "$1/.bin/$2")"
+                  [ -x "$1/.bin/$2" ] || fail "$1/.bin/$2 is not executable"
+                  shebang=$(head -n 1 "$1/.bin/$2")
                   case "$shebang" in
                     "#!${builtins.storeDir}/"*/bin/node) ;;
-                    *) fail "$1/.bin/semver starts with $shebang" ;;
+                    *) fail "$1/.bin/$2 starts with $shebang" ;;
                   esac
                 }
 
@@ -110,13 +112,14 @@
 
                 [ -f "$tree/semver/package.json" ] || fail "semver/package.json is missing"
                 version "$tree/semver" 7.7.3
-                bin "$tree"
+                bin "$tree" semver ../semver/bin/semver.js
+                bin "$tree" uuid ../node-uuid/bin/uuid
 
                 member=${fixture}/package/two/node_modules
                 [ -f "$member/semver/package.json" ] \
                   || fail "package/two/node_modules/semver/package.json is missing"
                 version "$member/semver" 6.3.1
-                bin "$member"
+                bin "$member" semver ../semver/bin/semver.js
 
                 touch $out
               '';
@@ -176,6 +179,7 @@
                   two=$(cd package/two && node -p "require('semver/package.json').version")
                   [ "$two" = "6.3.1" ] || fail "package/two resolves semver $two"
                   node_modules/.bin/semver 1.2.3 > /dev/null || fail "node_modules/.bin/semver does not run"
+                  node_modules/.bin/uuid v4 > /dev/null || fail "node_modules/.bin/uuid does not run"
                 '';
                 installPhase = ''
                   echo "one: semver $one; two: semver $two" > $out

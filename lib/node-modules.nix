@@ -287,33 +287,14 @@ let
         inherit target;
       }) bin;
 
+  # The directory an entry is unpacked or linked at, relative to `$out`.
+  installDir = package: "${modulesDir package.segments}/${package.path}";
+
   # Paths in install lines are relative to `$out`.
   install =
     package:
     let
-      modules = modulesDir package.segments;
-      dir = "${modules}/${package.path}";
-      binDir = lib.concatStringsSep "/" (
-        lib.filter (part: part != "") [
-          modules
-          package.parentDir
-          ".bin"
-        ]
-      );
-      ownDir = lib.last package.segments;
-      linkBin =
-        bin:
-        let
-          target = lib.removePrefix "./" bin.target;
-        in
-        "link_bin ${
-          lib.escapeShellArgs [
-            binDir
-            bin.name
-            "${dir}/${target}"
-            "../${ownDir}/${target}"
-          ]
-        }";
+      dir = installDir package;
     in
     if package.kind == "workspace" then
       # Relative to the link's own directory: `../` per segment of
@@ -325,17 +306,69 @@ let
         ]
       }"
     else
-      lib.concatStringsSep "\n" (
-        [
-          "unpack ${
-            lib.escapeShellArgs [
-              (tarball package)
-              dir
-            ]
-          }"
+      "unpack ${
+        lib.escapeShellArgs [
+          (tarball package)
+          dir
         ]
-        ++ map linkBin (bins package)
-      );
+      }";
+
+  # Every bin a kept registry package declares, with the `.bin` directory it
+  # goes in: the one beside the package, in the same node_modules.
+  binLinks = lib.concatMap (
+    package:
+    let
+      modules = modulesDir package.segments;
+      ownDir = lib.last package.segments;
+    in
+    map (
+      bin:
+      let
+        target = lib.removePrefix "./" bin.target;
+      in
+      {
+        inherit ownDir;
+        binDir = lib.concatStringsSep "/" (
+          lib.filter (part: part != "") [
+            modules
+            package.parentDir
+            ".bin"
+          ]
+        );
+        inherit (bin) name;
+        file = "${installDir package}/${target}";
+        link = "../${ownDir}/${target}";
+      }
+    ) (bins package)
+  ) (lib.filter (package: package.kind == "npm") kept);
+
+  # bun links a node_modules directory's bins in ascending byte order of
+  # the packages' folder names (a priority queue keyed by dependency name,
+  # `PackageInstaller.link_tree_bins`), and skips a `.bin` path it has
+  # already linked (`bin.Linker.link_bin_or_create_shim`); a bin whose file
+  # is missing is skipped without claiming the path. So each `.bin` path
+  # gets one `link_bin` with its candidates in that order, and the build
+  # links the first one whose file exists. `sort` is stable, so two bins of
+  # one name from one package stay in the order `bins` lists them.
+  linkBins = lib.mapAttrsToList (
+    _: candidates:
+    let
+      ordered = lib.sort (a: b: a.ownDir < b.ownDir) candidates;
+      first = head ordered;
+    in
+    "link_bin ${
+      lib.escapeShellArgs (
+        [
+          first.binDir
+          first.name
+        ]
+        ++ lib.concatMap (candidate: [
+          candidate.file
+          candidate.link
+        ]) ordered
+      )
+    }"
+  ) (lib.groupBy (bin: "${bin.binDir}/${bin.name}") binLinks);
 
   # Every entry is classified (and unsupported sources throw) even when the
   # host platform drops it, so the lock fails the same way on every system.
@@ -386,19 +419,23 @@ pkgs.stdenvNoCC.mkDerivation {
       chmod -R u+rwX "$out/$2"
     }
 
+    # link_bin <.bin dir> <name> (<file> <link target>)...: links the first
+    # candidate whose file exists.
     link_bin() {
-      if [ ! -f "$out/$3" ]; then
-        echo "bunix: skipping bin $2: $3 does not exist" >&2
-        return
-      fi
-      if [ -e "$out/$1/$2" ] || [ -L "$out/$1/$2" ]; then
-        echo "bunix: two packages install bin $1/$2" >&2
-        exit 1
-      fi
-      mkdir -p "$out/$1"
-      chmod +x "$out/$3"
-      patchShebangs --host "$out/$3" > /dev/null
-      ln -s "$4" "$out/$1/$2"
+      dir=$1
+      name=$2
+      shift 2
+      while [ $# -gt 0 ]; do
+        if [ -f "$out/$1" ]; then
+          mkdir -p "$out/$dir"
+          chmod +x "$out/$1"
+          patchShebangs --host "$out/$1" > /dev/null
+          ln -s "$2" "$out/$dir/$name"
+          return
+        fi
+        echo "bunix: skipping bin $name: $1 does not exist" >&2
+        shift 2
+      done
     }
 
     link_workspace() {
@@ -407,6 +444,7 @@ pkgs.stdenvNoCC.mkDerivation {
     }
 
     ${lib.concatMapStringsSep "\n" install kept}
+    ${lib.concatStringsSep "\n" linkBins}
   '';
 
   passthru = {

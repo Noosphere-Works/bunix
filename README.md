@@ -153,8 +153,13 @@ literally named `node_modules`. The files that `.bin` links point to are made
 executable, and their `#!/usr/bin/env node` line is patched to nixpkgs'
 `nodejs`, because Nix sandboxes have no `/usr/bin/env`. Everything else is
 byte-identical to the tarballs. A bin whose file is missing from its package
-is skipped with a warning. If two packages install the same bin, the build
-fails.
+is skipped with a warning. When packages in one `node_modules` declare the
+same bin name, the `.bin` link goes to the package whose folder name sorts
+first in byte order, as bun's hoisted install does: it links a directory's
+bins in that order and skips a `.bin` path it has already linked. A package
+whose bin file is missing does not claim the name. So `@playwright/test` wins
+`.bin/playwright` over `playwright`, and an alias `zz-pw` for
+`@playwright/test` would lose it to `playwright`.
 
 `passthru.kept` lists the lock entries in the tree for this host.
 `passthru.lockPackages` holds every lock entry, classified.

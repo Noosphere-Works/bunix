@@ -3,7 +3,9 @@
   "version": "0.0.0",
   "private": true,
   "dependencies": {
+    "node-uuid": "1.4.8",
     "semver": "7.7.3",
-    "two": "workspace:*"
+    "two": "workspace:*",
+    "uuid": "11.1.0"
   }
 }
